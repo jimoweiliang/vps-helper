@@ -205,7 +205,7 @@ get_status_display() {
 }
 
 system_check() {
-    clear
+    clear 2>/dev/null || true
     log "${BLUE}================ 系统体检 ================${PLAIN}"
     log "主机名: $(hostname)"
     log "系统: $(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"' || uname -a)"
@@ -331,7 +331,7 @@ EOF
 }
 
 view_security_report() {
-    clear
+    clear 2>/dev/null || true
     if ! has_cmd fail2ban-client; then
         log "${YELLOW}未检测到 fail2ban-client，尝试安装 fail2ban...${PLAIN}"
         ensure_packages fail2ban || true
@@ -522,7 +522,7 @@ generate_reality_link_helper() {
 }
 
 network_quality_check() {
-    clear
+    clear 2>/dev/null || true
     log "${BLUE}================ 网络质量检测 ================${PLAIN}"
     log "${YELLOW}公网 IP:${PLAIN}"
     curl -4 --connect-timeout 8 -sS https://ip.sb || true
@@ -601,7 +601,7 @@ speedtest_menu() {
 }
 
 security_audit() {
-    clear
+    clear 2>/dev/null || true
     log "${BLUE}================ VPS 安全体检 ================${PLAIN}"
     log "${YELLOW}SSH 配置:${PLAIN}"
     if [[ -f /etc/ssh/sshd_config ]]; then
@@ -775,7 +775,7 @@ PY
 
 # ---------------- TCP 智能调优 ----------------
 tcp_show_current_state() {
-    clear
+    clear 2>/dev/null || true
     log "${BLUE}================ TCP 线路状态检测 ================${PLAIN}"
 
     log "${YELLOW}核心 TCP 参数:${PLAIN}"
@@ -1015,7 +1015,7 @@ tcp_iperf_helper() {
 
 tcp_smart_tune_menu() {
     while true; do
-        clear
+        clear 2>/dev/null || true
         echo -e "${BLUE}================ TCP 智能调优/回滚 ================${PLAIN}"
         echo "1. 检测当前 TCP/线路状态并给建议"
         echo "2. 应用基础 BBR/fq 调优"
@@ -1037,7 +1037,7 @@ tcp_smart_tune_menu() {
             *) log "${RED}无效选择${PLAIN}" ;;
         esac
         echo ""
-        read -r -p "按回车继续..."
+        read -r -p "按回车继续..." || return
     done
 }
 
@@ -1047,7 +1047,7 @@ environment_init() {
 }
 
 while true; do
-    clear
+    clear 2>/dev/null || true
     local_tcp_ctrl=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}' || true)
     BBR_INFO=$([[ "${local_tcp_ctrl}" == "bbr" ]] && echo -e "${GREEN}BBR已开启${PLAIN}" || echo -e "${YELLOW}未开启${PLAIN}")
 
@@ -1081,7 +1081,7 @@ while true; do
     echo -e "  0. 退出"
     echo -e "${BLUE}==================================================${PLAIN}"
 
-    read -r -p "请输入选择 [0-22]: " num
+    read -r -p "请输入选择 [0-22]: " num || exit 0
     case "$num" in
         1) ensure_packages fail2ban && smart_fix_fail2ban ;;
         2) run_remote_script "linux_netspeed_tcp" "https://github.com/ylx2016/Linux-NetSpeed/raw/master/tcp.sh" "bash" ;;
@@ -1134,5 +1134,5 @@ while true; do
     esac
 
     echo ""
-    read -r -p "按回车继续..."
+    read -r -p "按回车继续..." || exit 0
 done
