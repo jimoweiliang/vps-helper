@@ -882,14 +882,59 @@ tcp_backup_config() {
     echo "$dir"
 }
 
+tcp_neutralize_sysctl_conf_conflicts() {
+    local tune_file="$1"
+    local backup_dir="$2"
+    local tmp changed=0
+
+    [[ -f /etc/sysctl.conf && -f "$tune_file" ]] || return 0
+
+    tmp=$(mktemp /tmp/vps-helper-sysctl-conf.XXXXXX)
+    awk '
+        FNR == NR {
+            if ($0 ~ /^[[:space:]]*#/ || $0 !~ /=/) next
+            split($0, a, "=")
+            k = a[1]
+            gsub(/^[ \t]+|[ \t]+$/, "", k)
+            if (k != "") keys[k] = 1
+            next
+        }
+        {
+            if ($0 ~ /^[[:space:]]*#/ || $0 !~ /=/) {
+                print
+                next
+            }
+            split($0, a, "=")
+            k = a[1]
+            gsub(/^[ \t]+|[ \t]+$/, "", k)
+            if (k in keys) {
+                print "# vps-helper disabled duplicate: " $0
+            } else {
+                print
+            }
+        }
+    ' "$tune_file" /etc/sysctl.conf > "$tmp"
+
+    if ! cmp -s "$tmp" /etc/sysctl.conf; then
+        cp -a /etc/sysctl.conf "$backup_dir/sysctl.conf.before-vps-helper-dedupe" 2>/dev/null || true
+        cp "$tmp" /etc/sysctl.conf
+        changed=1
+    fi
+    rm -f "$tmp"
+
+    if [[ "$changed" -eq 1 ]]; then
+        log "${YELLOW}已注释 /etc/sysctl.conf 中与 TCP 调优档冲突的旧参数（备份已保存）。${PLAIN}"
+    fi
+}
+
 tcp_apply_profile() {
     local profile="$1"
-    local backup_dir
+    local backup_dir tune_file="/etc/sysctl.d/99-vps-proxy-tcp-tune.conf"
     backup_dir=$(tcp_backup_config "$profile")
 
     case "$profile" in
         baseline)
-            cat > /etc/sysctl.d/99-vps-proxy-tcp-tune.conf <<'EOF'
+            cat > "$tune_file" <<'EOF'
 # VPS proxy TCP baseline tuning
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -897,6 +942,7 @@ net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_ecn = 2
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 net.ipv4.ip_local_port_range = 10240 65535
@@ -910,7 +956,7 @@ net.ipv4.tcp_synack_retries = 4
 EOF
             ;;
         high_latency)
-            cat > /etc/sysctl.d/99-vps-proxy-tcp-tune.conf <<'EOF'
+            cat > "$tune_file" <<'EOF'
 # VPS proxy TCP tuning - BBR/fq + high latency path
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -918,6 +964,7 @@ net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_ecn = 2
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 net.core.netdev_max_backlog = 250000
@@ -939,7 +986,7 @@ net.ipv4.tcp_synack_retries = 4
 EOF
             ;;
         mobile_qos)
-            cat > /etc/sysctl.d/99-vps-proxy-tcp-tune.conf <<'EOF'
+            cat > "$tune_file" <<'EOF'
 # VPS proxy TCP tuning - mobile/QoS conservative profile
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -971,15 +1018,22 @@ EOF
         *) log "${RED}未知档位：${profile}${PLAIN}"; return 1 ;;
     esac
 
+    tcp_neutralize_sysctl_conf_conflicts "$tune_file" "$backup_dir"
+
     log "${YELLOW}应用 sysctl 参数...${PLAIN}"
     sysctl --system >/tmp/vps-helper-sysctl.log 2>&1 || {
         log "${YELLOW}sysctl --system 返回非零，以下是输出；通常是个别系统不支持某参数。${PLAIN}"
         sed -n '1,120p' /tmp/vps-helper-sysctl.log || true
     }
+    sysctl -p "$tune_file" >/tmp/vps-helper-sysctl-profile.log 2>&1 || {
+        log "${YELLOW}单独加载 TCP 调优档返回非零，以下是输出：${PLAIN}"
+        sed -n '1,120p' /tmp/vps-helper-sysctl-profile.log || true
+    }
 
     local dev
     dev=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)
     if [[ -n "$dev" ]]; then
+        tc qdisc replace dev "$dev" root fq 2>/dev/null || true
         ip link set dev "$dev" txqueuelen 10000 2>/dev/null || true
     fi
 
