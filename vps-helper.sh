@@ -166,8 +166,9 @@ unlock_apt() {
 
 ensure_packages() {
     unlock_apt || true
-    run_cmd apt update -y
-    run_cmd apt install -y "$@"
+    export DEBIAN_FRONTEND=noninteractive
+    run_cmd apt-get update -y
+    run_cmd apt-get install -y "$@"
 }
 
 backup_xui() {
@@ -847,6 +848,33 @@ tcp_backup_config() {
     mkdir -p "$dir"
     cp -a /etc/sysctl.conf "$dir/sysctl.conf.bak" 2>/dev/null || true
     cp -a /etc/sysctl.d "$dir/sysctl.d.bak" 2>/dev/null || true
+    sysctl \
+        net.core.default_qdisc \
+        net.ipv4.tcp_congestion_control \
+        net.ipv4.tcp_fastopen \
+        net.ipv4.tcp_slow_start_after_idle \
+        net.ipv4.tcp_mtu_probing \
+        net.ipv4.tcp_no_metrics_save \
+        net.core.somaxconn \
+        net.ipv4.tcp_max_syn_backlog \
+        net.core.netdev_max_backlog \
+        net.core.rmem_max \
+        net.core.wmem_max \
+        net.core.rmem_default \
+        net.core.wmem_default \
+        net.ipv4.tcp_rmem \
+        net.ipv4.tcp_wmem \
+        net.ipv4.tcp_notsent_lowat \
+        net.ipv4.ip_local_port_range \
+        net.ipv4.tcp_fin_timeout \
+        net.ipv4.tcp_keepalive_time \
+        net.ipv4.tcp_keepalive_intvl \
+        net.ipv4.tcp_keepalive_probes \
+        net.ipv4.tcp_tw_reuse \
+        net.ipv4.tcp_syn_retries \
+        net.ipv4.tcp_synack_retries \
+        net.ipv4.tcp_ecn \
+        > "$dir/runtime-sysctl.values" 2>/dev/null || true
     if systemctl list-unit-files x-ui.service >/dev/null 2>&1; then
         mkdir -p "$dir/systemd"
         cp -a /etc/systemd/system/x-ui.service.d "$dir/systemd/x-ui.service.d.bak" 2>/dev/null || true
@@ -994,6 +1022,14 @@ tcp_restore_backup() {
         systemctl daemon-reload || true
     fi
     sysctl --system >/tmp/vps-helper-sysctl-restore.log 2>&1 || sed -n '1,120p' /tmp/vps-helper-sysctl-restore.log || true
+    if [[ -f "$dir/runtime-sysctl.values" ]]; then
+        sysctl -p "$dir/runtime-sysctl.values" >/tmp/vps-helper-sysctl-runtime-restore.log 2>&1 || {
+            log "${YELLOW}部分运行时 sysctl 参数恢复失败，以下为输出：${PLAIN}"
+            sed -n '1,120p' /tmp/vps-helper-sysctl-runtime-restore.log || true
+        }
+    else
+        log "${YELLOW}此备份缺少 runtime-sysctl.values；配置已回滚，但部分运行时参数可能需重启后恢复。${PLAIN}"
+    fi
     log "${GREEN}✅ 已尝试回滚：${dir}${PLAIN}"
 }
 
