@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =========================================================
-# VPS 综合运维助手 (V9.2 TCP智能调优版)
+# VPS 综合运维助手 (V9.4 TCP智能调优版)
 # 重点改动：
 #  - 默认写操作日志到 /var/log/vps-helper.log
 #  - 远程脚本执行前下载到本地并显示 SHA256
@@ -12,6 +12,9 @@
 #  - 增加系统体检、端口查看、Xray 版本查看/回退辅助
 #  - 增加网络质量检测、AI/流媒体解锁、测速、安全体检、Reality SNI 切换、订阅文件生成
 #  - 增加 TCP 智能调优/回滚，根据 BBR、缓冲、重传、443 连接状态给出建议
+#  - 借鉴 netshape：增加 qdisc/限速诊断、fq 单连接限速实验
+#  - 增加 iperf3 结果判读，根据上下行/重传/官方限速推荐调优档
+#  - 增加本地网络画像记录/对比，区分家宽/公司/手机网络测试结果
 # =========================================================
 
 set -Eeuo pipefail
@@ -1103,6 +1106,303 @@ tcp_iperf_helper() {
     esac
 }
 
+
+tcp_qdisc_diagnose() {
+    clear 2>/dev/null || true
+    log "${BLUE}================ qdisc / 限速诊断 ================${PLAIN}"
+
+    local dev
+    dev=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)
+    if [[ -z "$dev" ]]; then
+        log "${RED}未找到默认出口网卡。${PLAIN}"
+        return
+    fi
+
+    log "${YELLOW}默认出口网卡:${PLAIN} ${dev}"
+    ip -br link show dev "$dev" 2>/dev/null || true
+
+    log "${YELLOW}当前队列详情:${PLAIN}"
+    if has_cmd tc; then
+        tc -s qdisc show dev "$dev" 2>/dev/null || true
+    else
+        log "${YELLOW}未检测到 tc/iproute2。${PLAIN}"
+    fi
+
+    log "${YELLOW}判断:${PLAIN}"
+    local qdisc_text
+    qdisc_text=$(tc qdisc show dev "$dev" 2>/dev/null || true)
+    if echo "$qdisc_text" | grep -q "fq .*maxrate"; then
+        log "- 检测到 fq maxrate：当前存在单连接限速，适合压重传，但会限制峰值。"
+    elif echo "$qdisc_text" | grep -qE "htb|tbf|cake"; then
+        log "- 检测到整形队列（HTB/TBF/CAKE）：请确认这是你主动设置的限速。"
+    elif echo "$qdisc_text" | grep -q "fq"; then
+        log "- 已使用 fq 队列，适合 BBR；未发现明显 tc 限速。"
+    elif echo "$qdisc_text" | grep -q "mq"; then
+        log "- 根队列是 mq；如果子队列里有 fq，属于多队列网卡的正常情况。"
+    else
+        log "- 未看到 fq；如果使用 BBR，建议应用 TCP 调优档。"
+    fi
+
+    log "${YELLOW}可能冲突的旧服务:${PLAIN}"
+    local unit
+    for unit in netshape-manager.service netshape.service tc-fq-maxrate.service netpace.service; do
+        if systemctl is-enabled "$unit" >/dev/null 2>&1 || systemctl is-active "$unit" >/dev/null 2>&1; then
+            systemctl status "$unit" --no-pager -l | sed -n '1,18p' || true
+        fi
+    done
+
+    log "${YELLOW}sysctl 重复项检查:${PLAIN}"
+    grep -R "net.ipv4.tcp_congestion_control\|net.core.default_qdisc\|net.ipv4.tcp_ecn\|net.ipv4.tcp_rmem\|net.ipv4.tcp_wmem\|net.core.rmem_max\|net.core.wmem_max\|net.ipv4.tcp_notsent_lowat" \
+        /etc/sysctl.conf /etc/sysctl.d/*.conf 2>/dev/null | sed -n '1,160p' || true
+
+    log "${BLUE}==================================================${PLAIN}"
+}
+
+tcp_shape_menu() {
+    local dev rate
+    dev=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)
+    [[ -z "$dev" ]] && { log "${RED}未找到默认出口网卡。${PLAIN}"; return; }
+
+    log "${YELLOW}--- fq 单连接限速实验（借鉴 netshape）---${PLAIN}"
+    log "用途：当线路重传很高时，限制单条 TCP 峰值，避免 BBR 过冲。"
+    log "注意：这会降低单连接最高速度；代理节点不建议长期盲目限速。"
+    echo "1. 设置单连接 maxrate"
+    echo "2. 恢复 fq 无单连接限速"
+    echo "0. 返回"
+    read -r -p "请选择 [0-2]: " n || return
+    case "$n" in
+        1)
+            read -r -p "输入单连接上限 Mbps（例：50/100/200）: " rate || return
+            [[ "$rate" =~ ^[0-9]+$ && "$rate" -gt 0 ]] || { log "${RED}速率无效${PLAIN}"; return; }
+            if confirm_action "确认设置 ${dev} 单连接上限为 ${rate} Mbps 吗？"; then
+                tc qdisc replace dev "$dev" root fq maxrate "${rate}mbit" || {
+                    log "${RED}设置失败，当前内核/tc 可能不支持 fq maxrate。${PLAIN}"
+                    return
+                }
+                ip link set dev "$dev" txqueuelen 10000 2>/dev/null || true
+                log "${GREEN}✅ 已设置 fq maxrate：单连接 ≤ ${rate} Mbps${PLAIN}"
+            fi
+            ;;
+        2)
+            tc qdisc replace dev "$dev" root fq 2>/dev/null || true
+            ip link set dev "$dev" txqueuelen 10000 2>/dev/null || true
+            log "${GREEN}✅ 已恢复 fq，无单连接 maxrate${PLAIN}"
+            ;;
+        0) return ;;
+        *) log "${RED}无效选择${PLAIN}" ;;
+    esac
+}
+
+tcp_iperf_result_advisor() {
+    clear 2>/dev/null || true
+    log "${BLUE}================ iperf3 结果智能建议 ================${PLAIN}"
+    log "请按 iperf3 结果输入 Mbps；不确定可直接回车填 0。"
+    log "方向说明："
+    log "  本地 -> 服务器：iperf3 -c 服务器IP"
+    log "  服务器 -> 本地：iperf3 -c 服务器IP -R"
+
+    local up1 up4 down1 down4 retr_up retr_down cap
+    read -r -p "本地 -> 服务器 单线程 Mbps: " up1 || return
+    read -r -p "本地 -> 服务器 多线程 Mbps: " up4 || return
+    read -r -p "服务器 -> 本地 单线程 Mbps: " down1 || return
+    read -r -p "服务器 -> 本地 多线程 Mbps: " down4 || return
+    read -r -p "本地 -> 服务器 Retr 总数（没有填 0）: " retr_up || return
+    read -r -p "服务器 -> 本地 Retr 总数（没有填 0）: " retr_down || return
+    read -r -p "服务器官方/商家限速 Mbps（没有填 0）: " cap || return
+
+    up1=${up1:-0}; up4=${up4:-0}; down1=${down1:-0}; down4=${down4:-0}; retr_up=${retr_up:-0}; retr_down=${retr_down:-0}; cap=${cap:-0}
+    for x in "$up1" "$up4" "$down1" "$down4" "$retr_up" "$retr_down" "$cap"; do
+        [[ "$x" =~ ^[0-9]+([.][0-9]+)?$ ]] || { log "${RED}输入包含非法数字：${x}${PLAIN}"; return; }
+    done
+
+    log "${YELLOW}分析:${PLAIN}"
+    awk -v down4="$down4" -v cap="$cap" 'BEGIN{exit !(cap>0 && down4>=cap*0.85)}' \
+        && log "- 下行接近官方限速；这类瓶颈不能靠 TCP 调优突破。" || true
+    awk -v up1="$up1" -v down1="$down1" 'BEGIN{exit !(down1>0 && up1>0 && up1<down1*0.25)}' \
+        && log "- 上行明显弱于下行，符合移动/QoS/方向性限速特征。" || true
+    awk -v up4="$up4" -v up1="$up1" 'BEGIN{exit !(up1>0 && up4>up1*2)}' \
+        && log "- 多线程明显好于单线程，说明单连接受限或 BBR 过冲后被压。" || true
+    awk -v r="$retr_up" 'BEGIN{exit !(r>=1000)}' \
+        && log "- 本地到服务器方向重传很高，建议优先保守档或单连接限速实验。" || true
+    awk -v r="$retr_down" 'BEGIN{exit !(r>=3000)}' \
+        && log "- 服务器到本地方向重传很高，线路拥塞/QoS 概率高。" || true
+
+    log "${YELLOW}建议:${PLAIN}"
+    local recommend
+    recommend=$(tcp_profile_recommendation "$up1" "$up4" "$down1" "$down4" "$retr_up" "$retr_down" "$cap")
+    case "$recommend" in
+        mobile_qos) log "- 推荐应用【移动/QoS 保守档】。理由：上行弱/重传高，ECN=0 更稳。" ;;
+        none) log "- 不建议继续调参。理由：已经接近官方限速。" ;;
+        *) log "- 推荐应用【跨境高延迟/代理长连接调优】。" ;;
+    esac
+
+    if awk -v r="$retr_down" 'BEGIN{exit !(r>=3000)}'; then
+        log "- 可额外测试【fq 单连接限速实验】，例如 50/100/200 Mbps；如果重传下降且体感更稳，再保留。"
+    fi
+
+    if [[ "$recommend" != "none" ]] && confirm_action "是否现在应用推荐档位：${recommend}"; then
+        tcp_apply_profile "$recommend"
+    fi
+
+    log "${BLUE}====================================================${PLAIN}"
+}
+
+
+
+tcp_profile_recommendation() {
+    local up1="$1" up4="$2" down1="$3" down4="$4" retr_up="$5" retr_down="$6" cap="$7"
+    local recommend="high_latency"
+
+    if awk -v up1="$up1" -v down1="$down1" -v retr="$retr_up" 'BEGIN{exit !(down1>0 && (up1<down1*0.35 || retr>=1000))}'; then
+        recommend="mobile_qos"
+    elif awk -v down4="$down4" -v cap="$cap" 'BEGIN{exit !(cap>0 && down4>=cap*0.85)}'; then
+        recommend="none"
+    fi
+
+    printf '%s\n' "$recommend"
+}
+
+tcp_network_profile_file() {
+    mkdir -p /root/.vps-helper
+    printf '%s\n' "/root/.vps-helper/network-profiles.tsv"
+}
+
+tcp_network_profile_header() {
+    local file="$1"
+    if [[ ! -f "$file" ]]; then
+        printf 'time\tlocal_profile\tserver_label\tup1_mbps\tup4_mbps\tdown1_mbps\tdown4_mbps\tretr_up\tretr_down\tcap_mbps\trecommend\tnote\n' > "$file"
+    fi
+}
+
+tcp_network_profile_add() {
+    local file local_profile server_label up1 up4 down1 down4 retr_up retr_down cap note recommend now
+    file=$(tcp_network_profile_file)
+    tcp_network_profile_header "$file"
+
+    log "${YELLOW}--- 新增本地网络画像 ---${PLAIN}"
+    read -r -p "本地网络名（例 home-cmcc-night / office-telecom / iphone-5g）: " local_profile || return
+    read -r -p "服务器标签（例 HK-87 / JP / Oracle）: " server_label || return
+    read -r -p "本地 -> 服务器 单线程 Mbps: " up1 || return
+    read -r -p "本地 -> 服务器 多线程 Mbps: " up4 || return
+    read -r -p "服务器 -> 本地 单线程 Mbps: " down1 || return
+    read -r -p "服务器 -> 本地 多线程 Mbps: " down4 || return
+    read -r -p "本地 -> 服务器 Retr 总数（没有填 0）: " retr_up || return
+    read -r -p "服务器 -> 本地 Retr 总数（没有填 0）: " retr_down || return
+    read -r -p "服务器官方/商家限速 Mbps（没有填 0）: " cap || return
+    read -r -p "备注（可空）: " note || true
+
+    [[ -n "$local_profile" ]] || { log "${RED}本地网络名不能为空${PLAIN}"; return; }
+    [[ -n "$server_label" ]] || server_label="$(hostname 2>/dev/null || echo server)"
+    up1=${up1:-0}; up4=${up4:-0}; down1=${down1:-0}; down4=${down4:-0}; retr_up=${retr_up:-0}; retr_down=${retr_down:-0}; cap=${cap:-0}
+    for x in "$up1" "$up4" "$down1" "$down4" "$retr_up" "$retr_down" "$cap"; do
+        [[ "$x" =~ ^[0-9]+([.][0-9]+)?$ ]] || { log "${RED}输入包含非法数字：${x}${PLAIN}"; return; }
+    done
+
+    recommend=$(tcp_profile_recommendation "$up1" "$up4" "$down1" "$down4" "$retr_up" "$retr_down" "$cap")
+    now=$(date '+%F %T')
+
+    local_profile=${local_profile//$'\t'/ }
+    server_label=${server_label//$'\t'/ }
+    note=${note//$'\t'/ }
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$now" "$local_profile" "$server_label" "$up1" "$up4" "$down1" "$down4" "$retr_up" "$retr_down" "$cap" "$recommend" "$note" >> "$file"
+
+    log "${GREEN}✅ 已保存画像：${local_profile} / ${server_label}${PLAIN}"
+    log "${YELLOW}推荐档位:${PLAIN} ${recommend}"
+    log "${YELLOW}记录文件:${PLAIN} ${file}"
+}
+
+tcp_network_profile_list() {
+    local file
+    file=$(tcp_network_profile_file)
+    tcp_network_profile_header "$file"
+    log "${BLUE}================ 本地网络画像列表 ================${PLAIN}"
+    awk -F '\t' '
+        NR==1 {next}
+        {
+            printf "%3d. %-19s  %-18s  %-10s  up:%6s/%6s  down:%6s/%6s  retr:%s/%s  cap:%s  rec:%s  %s\n",
+                NR-1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+        }
+    ' "$file"
+    log "${BLUE}==================================================${PLAIN}"
+}
+
+tcp_network_profile_compare() {
+    local file
+    file=$(tcp_network_profile_file)
+    tcp_network_profile_header "$file"
+    log "${BLUE}================ 本地网络画像对比 ================${PLAIN}"
+    awk -F '\t' '
+        NR==1 {next}
+        {
+            key=$2 "\t" $3
+            if (!(key in count)) keys_seen++
+            count[key]++
+            up1[key]+=$4; up4[key]+=$5; down1[key]+=$6; down4[key]+=$7; ru[key]+=$8; rd[key]+=$9
+            rec[key]=$11
+        }
+        END {
+            if (keys_seen==0) {
+                print "暂无记录"
+                exit
+            }
+            printf "%-20s %-12s %5s %12s %12s %12s %12s %12s %12s %-12s\n", "本地网络", "服务器", "次数", "up1均值", "up4均值", "down1均值", "down4均值", "retr_up均值", "retr_down均值", "最近推荐"
+            for (k in count) {
+                split(k, a, "\t")
+                c=count[k]
+                printf "%-20s %-12s %5d %12.1f %12.1f %12.1f %12.1f %12.0f %12.0f %-12s\n",
+                    a[1], a[2], c, up1[k]/c, up4[k]/c, down1[k]/c, down4[k]/c, ru[k]/c, rd[k]/c, rec[k]
+            }
+        }
+    ' "$file"
+    log "${BLUE}==================================================${PLAIN}"
+}
+
+tcp_network_profile_delete() {
+    local file idx tmp total
+    file=$(tcp_network_profile_file)
+    tcp_network_profile_header "$file"
+    tcp_network_profile_list
+    total=$(awk 'END{print NR-1}' "$file")
+    [[ "${total:-0}" -le 0 ]] && { log "${YELLOW}暂无可删除记录${PLAIN}"; return; }
+    read -r -p "输入要删除的编号: " idx || return
+    [[ "$idx" =~ ^[0-9]+$ && "$idx" -ge 1 && "$idx" -le "$total" ]] || { log "${RED}编号无效${PLAIN}"; return; }
+    if ! confirm_action "确认删除第 ${idx} 条画像记录吗？"; then
+        log "${YELLOW}已取消删除${PLAIN}"
+        return
+    fi
+    tmp=$(mktemp /tmp/vps-helper-profile.XXXXXX)
+    awk -v del="$idx" 'NR==1 || NR-1!=del {print}' "$file" > "$tmp"
+    cp "$tmp" "$file"
+    rm -f "$tmp"
+    log "${GREEN}✅ 已删除第 ${idx} 条记录${PLAIN}"
+}
+
+tcp_network_profile_menu() {
+    while true; do
+        clear 2>/dev/null || true
+        echo -e "${BLUE}================ 本地网络画像记录/对比 ================${PLAIN}"
+        echo "1. 新增一条 iperf3 画像记录"
+        echo "2. 查看全部记录"
+        echo "3. 按 本地网络+服务器 聚合对比"
+        echo "4. 删除一条记录"
+        echo "0. 返回"
+        echo -e "${BLUE}======================================================${PLAIN}"
+        read -r -p "请选择 [0-4]: " n || return
+        case "$n" in
+            1) tcp_network_profile_add ;;
+            2) tcp_network_profile_list ;;
+            3) tcp_network_profile_compare ;;
+            4) tcp_network_profile_delete ;;
+            0) return ;;
+            *) log "${RED}无效选择${PLAIN}" ;;
+        esac
+        echo ""
+        read -r -p "按回车继续..." || return
+    done
+}
+
+
 tcp_smart_tune_menu() {
     while true; do
         clear 2>/dev/null || true
@@ -1112,10 +1412,14 @@ tcp_smart_tune_menu() {
         echo "3. 应用跨境高延迟/代理长连接调优（推荐）"
         echo "4. 应用移动/QoS 保守档（关闭 ECN，谨慎使用）"
         echo "5. 回滚到历史备份"
-        echo "6. iperf3 测速辅助"
+        echo "6. iperf3 服务端管理"
+        echo "7. qdisc / 限速诊断"
+        echo "8. 根据 iperf3 测试结果给调优建议"
+        echo "9. fq 单连接限速实验"
+        echo "10. 本地网络画像记录/对比"
         echo "0. 返回主菜单"
         echo -e "${BLUE}==================================================${PLAIN}"
-        read -r -p "请选择 [0-6]: " n
+        read -r -p "请选择 [0-10]: " n
         case "$n" in
             1) tcp_show_current_state ;;
             2) confirm_action "应用基础 BBR/fq 调优？" && tcp_apply_profile baseline ;;
@@ -1123,6 +1427,10 @@ tcp_smart_tune_menu() {
             4) confirm_action "应用移动/QoS 保守档？如果不确定，建议先用 3" && tcp_apply_profile mobile_qos ;;
             5) tcp_restore_backup ;;
             6) tcp_iperf_helper ;;
+            7) tcp_qdisc_diagnose ;;
+            8) tcp_iperf_result_advisor ;;
+            9) tcp_shape_menu ;;
+            10) tcp_network_profile_menu ;;
             0) return ;;
             *) log "${RED}无效选择${PLAIN}" ;;
         esac
@@ -1142,7 +1450,7 @@ while true; do
     BBR_INFO=$([[ "${local_tcp_ctrl}" == "bbr" ]] && echo -e "${GREEN}BBR已开启${PLAIN}" || echo -e "${YELLOW}未开启${PLAIN}")
 
     echo -e "${BLUE}==================================================${PLAIN}"
-    echo -e "${GREEN}       VPS 综合运维助手 V9.2 (TCP智能调优版)       ${PLAIN}"
+    echo -e "${GREEN}       VPS 综合运维助手 V9.4 (TCP智能调优版)       ${PLAIN}"
     echo -e "${BLUE}==================================================${PLAIN}"
     echo -e "  1. 🛡️  同步防御加固 (Fail2Ban jail.d)"
     echo -e "  2. 🚀  BBR / TCPx 加速管理 [${BBR_INFO}]"
@@ -1157,13 +1465,13 @@ while true; do
     echo -e "  9. 📦  Docker 状态/容器列表"
     echo -e "  10.🛣️  回程路由测试 (Backtrace)"
     echo -e "  11.📜 SSL 证书申请/续期并安装到 x-ui 路径"
-    echo -e "  12.⚡ iperf3 网络性能测速"
+    echo -e "  12.⚡ iperf3 服务端管理"
     echo -e "  13.🩺 系统体检/端口查看"
     echo -e "  14.🔁 Xray 版本管理/回退"
     echo -e "  15.🧩 Reality 节点参数辅助"
     echo -e "  16.🌐 网络质量检测"
     echo -e "  17.🔓 流媒体 / AI 解锁检测"
-    echo -e "  18.🧪 Speedtest / iperf3 测速"
+    echo -e "  18.🧪 综合测速 / iperf3"
     echo -e "  19.🔐 VPS 安全体检"
     echo -e "  20.🛰️ Reality SNI 一键切换"
     echo -e "  21.📡 自建订阅文件生成"
@@ -1200,15 +1508,7 @@ while true; do
             ;;
         10) run_remote_script "backtrace_install" "https://raw.githubusercontent.com/zhanghanyun/backtrace/master/install.sh" "php" ;;
         11) manage_acme_certificate ;;
-        12)
-            if has_cmd iperf3; then
-                log "${GREEN}iperf3 已安装，后台启动服务（5201 端口）...${PLAIN}"
-                iperf3 -s -D || true
-                log "${GREEN}✅ iperf3 server 已后台运行：iperf3 -c <服务器IP>${PLAIN}"
-            else
-                log "${YELLOW}iperf3 未安装，请先执行选项 3。${PLAIN}"
-            fi
-            ;;
+        12) tcp_iperf_helper ;;
         13) system_check ;;
         14) manage_xray_version ;;
         15) generate_reality_link_helper ;;
