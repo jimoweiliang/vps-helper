@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =========================================================
-# VPS 综合运维助手 (V9.5 TCP智能调优版)
+# VPS 综合运维助手 (V9.6 TCP智能调优版)
 # 重点改动：
 #  - 默认写操作日志到 /var/log/vps-helper.log
 #  - 远程脚本执行前下载到本地并显示 SHA256
@@ -485,50 +485,91 @@ manage_acme_certificate() {
     fi
     ensure_acme || return
 
-    local selected_domain renewal_mode=0 acme_ecc=1
+    local selected_domain renewal_mode=0 acme_ecc=1 action="" renewal_skipped=0
     local -a managed_domains=()
     mapfile -t managed_domains < <(acme_managed_domains)
 
     if ((${#managed_domains[@]} > 0)); then
         log "${GREEN}已扫描到 acme.sh 域名：${PLAIN}"
-        if ((${#managed_domains[@]} == 1)); then
-            selected_domain="${managed_domains[0]}"
-            log "自动选择：${selected_domain}"
-        else
-            local i choice
-            for i in "${!managed_domains[@]}"; do
-                printf '%s. %s\n' "$((i + 1))" "${managed_domains[$i]}"
-            done
-            read -r -p "选择要续期的域名 [1-${#managed_domains[@]}]: " choice
-            [[ "$choice" =~ ^[0-9]+$ ]] || { log "${RED}选择无效${PLAIN}"; return; }
-            ((choice >= 1 && choice <= ${#managed_domains[@]})) || { log "${RED}选择无效${PLAIN}"; return; }
-            selected_domain="${managed_domains[$((choice - 1))]}"
-        fi
-        renewal_mode=1
-        [[ -d "${ACME%/*}/${selected_domain}_ecc" ]] && acme_ecc=1 || acme_ecc=0
+        echo "1. 续期已有域名（证书未到续期时间时视为正常）"
+        echo "2. 申请/替换新域名证书"
+        echo "0. 返回"
+        local mode
+        read -r -p "请选择 [0-2]: " mode
+        case "$mode" in
+            1)
+                action="renew"
+                local i choice
+                if ((${#managed_domains[@]} == 1)); then
+                    selected_domain="${managed_domains[0]}"
+                    log "自动选择：${selected_domain}"
+                else
+                    for i in "${!managed_domains[@]}"; do
+                        printf '%s. %s\n' "$((i + 1))" "${managed_domains[$i]}"
+                    done
+                    read -r -p "选择要续期的域名 [1-${#managed_domains[@]}]: " choice
+                    [[ "$choice" =~ ^[0-9]+$ ]] || { log "${RED}选择无效${PLAIN}"; return 0; }
+                    ((choice >= 1 && choice <= ${#managed_domains[@]})) || { log "${RED}选择无效${PLAIN}"; return 0; }
+                    selected_domain="${managed_domains[$((choice - 1))]}"
+                fi
+                renewal_mode=1
+                [[ -d "${ACME%/*}/${selected_domain}_ecc" ]] && acme_ecc=1 || acme_ecc=0
+                ;;
+            2)
+                action="issue"
+                read -r -p "输入要申请/替换的新域名（例如 xc.eduxc.com）: " selected_domain
+                ;;
+            0) return 0 ;;
+            *) log "${RED}选择无效${PLAIN}"; return 0 ;;
+        esac
     else
         read -r -p "未扫描到已管理域名，请输入新域名: " selected_domain
-        [[ -z "$selected_domain" ]] && { log "${RED}域名不能为空${PLAIN}"; return; }
+        action="issue"
         acme_ecc=1
     fi
 
-    release_port80_temporarily || return
-    local acme_ok=0
-    if ((renewal_mode)); then
+    selected_domain="${selected_domain,,}"
+    if [[ ! "$selected_domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; then
+        log "${RED}域名格式无效：${selected_domain}${PLAIN}"
+        return 0
+    fi
+
+    release_port80_temporarily || return 0
+    local acme_ok=0 acme_rc=1 acme_log
+    acme_log=$(mktemp /tmp/vps-helper-acme.XXXXXX)
+    if [[ "$action" == "renew" ]]; then
         if ((acme_ecc)); then
-            "$ACME" --renew -d "$selected_domain" --ecc && acme_ok=1 || true
+            "$ACME" --renew -d "$selected_domain" --ecc >"$acme_log" 2>&1 || acme_rc=$?
         else
-            "$ACME" --renew -d "$selected_domain" && acme_ok=1 || true
+            "$ACME" --renew -d "$selected_domain" >"$acme_log" 2>&1 || acme_rc=$?
         fi
     else
-        "$ACME" --issue -d "$selected_domain" --standalone -k ec-256 && acme_ok=1 || true
+        "$ACME" --issue -d "$selected_domain" --standalone -k ec-256 >"$acme_log" 2>&1 || acme_rc=$?
     fi
     restore_port80_after_renew
+    cat "$acme_log"
+
+    if ((acme_rc == 0)); then
+        acme_ok=1
+    fi
+    if [[ "$action" == "renew" ]] && grep -qE 'Skipping\. Next renewal time is|Skip.*renew' "$acme_log"; then
+        acme_ok=1
+        renewal_skipped=1
+    elif grep -qE 'Cert success|Cert success\.|Your cert is in|Le_NextRenewTime' "$acme_log"; then
+        acme_ok=1
+    elif [[ "$action" == "issue" && -f "${ACME%/*}/${selected_domain}_ecc/${selected_domain}.cer" ]]; then
+        acme_ok=1
+    fi
+    rm -f "$acme_log"
 
     if [[ "$acme_ok" -ne 1 ]]; then
-        log "${RED}证书申请失败：${selected_domain}${PLAIN}"
+        log "${RED}证书处理失败：${selected_domain}${PLAIN}"
         log "${YELLOW}请确认域名解析到本机，安全组/防火墙放行 80。${PLAIN}"
-        return
+        return 0
+    fi
+
+    if ((renewal_skipped)); then
+        log "${GREEN}✅ 证书仍在有效期内，无需强制续期：${selected_domain}${PLAIN}"
     fi
 
     local cert_dir="/root/cert/${selected_domain}"
@@ -539,7 +580,10 @@ manage_acme_certificate() {
         --fullchain-file "${cert_dir}/fullchain.pem"
         --key-file "${cert_dir}/privkey.pem"
     )
-    "$ACME" "${install_args[@]}"
+    if ! "$ACME" "${install_args[@]}"; then
+        log "${RED}证书安装失败：${selected_domain}${PLAIN}"
+        return 0
+    fi
 
     log "${GREEN}✅ 证书已安装：${selected_domain}${PLAIN}"
     log "证书文件路径: ${cert_dir}/fullchain.pem"
@@ -1488,7 +1532,7 @@ while true; do
     BBR_INFO=$([[ "${local_tcp_ctrl}" == "bbr" ]] && echo -e "${GREEN}BBR已开启${PLAIN}" || echo -e "${YELLOW}未开启${PLAIN}")
 
     echo -e "${BLUE}==================================================${PLAIN}"
-    echo -e "${GREEN}       VPS 综合运维助手 V9.5 (TCP智能调优版)       ${PLAIN}"
+    echo -e "${GREEN}       VPS 综合运维助手 V9.6 (TCP智能调优版)       ${PLAIN}"
     echo -e "${BLUE}==================================================${PLAIN}"
     echo -e "  1. 🛡️  同步防御加固 (Fail2Ban jail.d)"
     echo -e "  2. 🚀  BBR / TCPx 加速管理 [${BBR_INFO}]"
@@ -1502,7 +1546,7 @@ while true; do
     echo -e "  8. 💾  虚拟内存 (SWAP) 管理"
     echo -e "  9. 📦  Docker 状态/容器列表"
     echo -e "  10.🛣️  回程路由测试 (Backtrace)"
-    echo -e "  11.📜 SSL 证书申请/续期并安装到 x-ui 路径"
+    echo -e "  11.📜 SSL 证书申请/续期/更换并安装到 x-ui 路径"
     echo -e "  12.⚡ iperf3 服务端管理"
     echo -e "  13.🩺 系统体检/端口查看"
     echo -e "  14.🧩 Reality 节点参数辅助"
