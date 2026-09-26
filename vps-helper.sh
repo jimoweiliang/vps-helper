@@ -6,6 +6,7 @@
 #  - 远程脚本执行前下载到本地并显示 SHA256
 #  - x-ui 固定使用 FranzKafkaYu/x-ui，安装/更新前自动备份数据库和核心配置
 #  - 证书申请自动安装到 /root/cert/<domain>/，并同步到 x-ui 证书目录
+#  - 证书更换后自动备份 x-ui 数据库并更新 webCertFile/webKeyFile，失败自动回滚
 #  - acme.sh 安装前自动安装 cron/curl/socat
 #  - Fail2Ban 改用 jail.d/vps-helper.local，不覆盖 jail.local
 #  - 80 端口释放不再默认 kill 非 systemd 进程
@@ -478,6 +479,112 @@ acme_managed_domains() {
     done | sort -u
 }
 
+update_xui_panel_certificate() {
+    local cert_file="$1"
+    local key_file="$2"
+    local db=""
+    local candidate
+    for candidate in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db; do
+        if [[ -f "$candidate" ]]; then
+            db="$candidate"
+            break
+        fi
+    done
+
+    if [[ -z "$db" ]]; then
+        log "${YELLOW}未找到 x-ui 数据库，跳过自动切换面板证书。${PLAIN}"
+        return 0
+    fi
+    if ! has_cmd sqlite3; then
+        if has_cmd apt-get; then
+            log "${YELLOW}未检测到 sqlite3，正在安装以自动更新 x-ui 证书路径...${PLAIN}"
+            ensure_packages sqlite3 || {
+                log "${YELLOW}sqlite3 安装失败，无法自动写入 x-ui 证书路径；请手动在面板设置。${PLAIN}"
+                return 0
+            }
+        elif has_cmd dnf; then
+            dnf install -y sqlite || {
+                log "${YELLOW}sqlite 安装失败，无法自动写入 x-ui 证书路径；请手动在面板设置。${PLAIN}"
+                return 0
+            }
+        elif has_cmd yum; then
+            yum install -y sqlite || {
+                log "${YELLOW}sqlite 安装失败，无法自动写入 x-ui 证书路径；请手动在面板设置。${PLAIN}"
+                return 0
+            }
+        else
+            log "${YELLOW}未检测到可用包管理器，无法自动写入 x-ui 证书路径；请手动在面板设置。${PLAIN}"
+            return 0
+        fi
+    fi
+
+    local was_active=0
+    if systemctl is-active --quiet x-ui.service 2>/dev/null; then
+        was_active=1
+        systemctl stop x-ui.service || {
+            log "${RED}无法停止 x-ui，取消自动证书切换。${PLAIN}"
+            return 0
+        }
+    fi
+
+    local backup_dir="/root/backup"
+    local backup_file="${backup_dir}/x-ui-cert-$(date +%Y%m%d-%H%M%S).db"
+    mkdir -p "$backup_dir"
+    cp -a "$db" "$backup_file" || {
+        ((was_active)) && systemctl start x-ui.service || true
+        log "${RED}无法备份 x-ui 数据库，取消自动证书切换。${PLAIN}"
+        return 0
+    }
+
+    local table="settings"
+    if ! sqlite3 "$db" "SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings' LIMIT 1;" 2>/dev/null | grep -q '^1$'; then
+        if sqlite3 "$db" "SELECT 1 FROM sqlite_master WHERE type='table' AND name='setting' LIMIT 1;" 2>/dev/null | grep -q '^1$'; then
+            table="setting"
+        else
+            ((was_active)) && systemctl start x-ui.service || true
+            log "${RED}未找到 x-ui 设置表，取消自动证书切换。${PLAIN}"
+            return 0
+        fi
+    fi
+
+    # 使用 here-document 传递多条 SQL，避免把字面量的 \n 写进 sqlite3。
+    if ! sqlite3 "$db" <<SQL
+BEGIN;
+UPDATE ${table} SET value='${cert_file}' WHERE key='webCertFile';
+INSERT INTO ${table}(key,value) SELECT 'webCertFile','${cert_file}' WHERE changes()=0;
+UPDATE ${table} SET value='${key_file}' WHERE key='webKeyFile';
+INSERT INTO ${table}(key,value) SELECT 'webKeyFile','${key_file}' WHERE changes()=0;
+COMMIT;
+SQL
+    then
+        cp -a "$backup_file" "$db"
+        ((was_active)) && systemctl start x-ui.service || true
+        log "${RED}自动写入 x-ui 证书路径失败，已恢复数据库备份。${PLAIN}"
+        return 0
+    fi
+
+    local saved_cert saved_key
+    saved_cert=$(sqlite3 "$db" "SELECT value FROM ${table} WHERE key='webCertFile' LIMIT 1;" 2>/dev/null || true)
+    saved_key=$(sqlite3 "$db" "SELECT value FROM ${table} WHERE key='webKeyFile' LIMIT 1;" 2>/dev/null || true)
+    if [[ "$saved_cert" != "$cert_file" || "$saved_key" != "$key_file" ]]; then
+        cp -a "$backup_file" "$db"
+        ((was_active)) && systemctl start x-ui.service || true
+        log "${RED}x-ui 证书路径校验失败，已恢复数据库备份。${PLAIN}"
+        return 0
+    fi
+
+    if ((was_active)); then
+        if ! systemctl start x-ui.service; then
+            cp -a "$backup_file" "$db"
+            systemctl start x-ui.service || true
+            log "${RED}x-ui 使用新证书启动失败，已恢复数据库备份。${PLAIN}"
+            return 0
+        fi
+    fi
+    log "${GREEN}✅ 已自动更新 x-ui 面板证书路径并保留备份：${backup_file}${PLAIN}"
+    return 0
+}
+
 manage_acme_certificate() {
     if (( DRY_RUN )); then
         log "${BLUE}[dry-run]${PLAIN} 跳过证书申请/续期、证书目录及 x-ui 路径写入"
@@ -606,7 +713,7 @@ manage_acme_certificate() {
         log "${GREEN}✅ 已同步到 x-ui 证书目录（自动跟随续期）${PLAIN}"
         log "x-ui 证书路径: ${xui_cert_dir}/fullchain.pem"
         log "x-ui 密钥路径: ${xui_cert_dir}/privkey.pem"
-        log "在 x-ui 中填入上述两条路径即可。"
+        update_xui_panel_certificate "${xui_cert_dir}/fullchain.pem" "${xui_cert_dir}/privkey.pem"
     else
         log "${YELLOW}未发现 x-ui 目录，跳过同步；安装 x-ui 后可重新执行本项。${PLAIN}"
     fi
