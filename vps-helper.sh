@@ -237,7 +237,7 @@ get_effective_ssh_ports() {
         ports=$(grep -RhiE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null |
             awk '{print $2}' | sort -nu | paste -sd, - || true)
     fi
-    printf '%s\\n' "${ports:-22}"
+    printf '%s\n' "${ports:-22}"
 }
 
 system_check() {
