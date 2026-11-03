@@ -228,6 +228,18 @@ get_status_display() {
     echo -e "${out:-${YELLOW}未发现活跃服务${PLAIN}}"
 }
 
+get_effective_ssh_ports() {
+    local ports=""
+    if has_cmd sshd; then
+        ports=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -nu | paste -sd, - || true)
+    fi
+    if [[ -z "$ports" ]]; then
+        ports=$(grep -RhiE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null |
+            awk '{print $2}' | sort -nu | paste -sd, - || true)
+    fi
+    printf '%s\\n' "${ports:-22}"
+}
+
 system_check() {
     clear 2>/dev/null || true
     log "${BLUE}================ 系统体检 ================${PLAIN}"
@@ -296,9 +308,24 @@ smart_fix_fail2ban() {
     fi
     mkdir -p /etc/fail2ban/filter.d /etc/fail2ban/jail.d /usr/local/x-ui /var/log
 
-    local ssh_log="/var/log/auth.log"
-    [[ -f /var/log/secure ]] && ssh_log="/var/log/secure"
-    touch "$ssh_log"
+    local ssh_log="" ssh_backend="polling" ssh_source_line="" ssh_ports
+    if [[ -f /var/log/auth.log ]]; then
+        ssh_log="/var/log/auth.log"
+        ssh_source_line="logpath = ${ssh_log}"
+    elif [[ -f /var/log/secure ]]; then
+        ssh_log="/var/log/secure"
+        ssh_source_line="logpath = ${ssh_log}"
+    elif has_cmd journalctl; then
+        ssh_backend="systemd"
+        ssh_source_line="journalmatch = _SYSTEMD_UNIT=sshd.service + _SYSTEMD_UNIT=ssh.service"
+        log "${YELLOW}未找到 auth.log/secure，Fail2Ban 将改用 systemd journal 读取 SSH 日志。${PLAIN}"
+    else
+        ssh_log="/var/log/auth.log"
+        ssh_source_line="logpath = ${ssh_log}"
+        log "${RED}未找到 SSH 日志文件或 systemd journal，sshd 监狱可能无法工作。${PLAIN}"
+    fi
+    [[ -n "$ssh_log" ]] && touch "$ssh_log"
+    ssh_ports=$(get_effective_ssh_ports)
     touch /usr/local/x-ui/access.log /var/log/nps.log /var/log/komari.log
 
     [[ -f /etc/fail2ban/jail.local ]] && cp -a /etc/fail2ban/jail.local "/etc/fail2ban/jail.local.bak.$(date +%F_%H%M%S)"
@@ -335,8 +362,9 @@ backend  = polling
 
 [sshd]
 enabled = true
-port    = ssh
-logpath = ${ssh_log}
+port    = ${ssh_ports}
+backend = ${ssh_backend}
+${ssh_source_line}
 
 [x-ui]
 enabled = true
@@ -357,9 +385,13 @@ filter  = komari
 logpath = /var/log/komari.log
 EOF
 
-    systemctl restart fail2ban || true
     systemctl enable fail2ban >/dev/null 2>&1 || true
-    log "${GREEN}✅ 分类监狱加固已同步：/etc/fail2ban/jail.d/vps-helper.local${PLAIN}"
+    if systemctl restart fail2ban; then
+        log "${GREEN}✅ 分类监狱加固已同步：/etc/fail2ban/jail.d/vps-helper.local${PLAIN}"
+    else
+        log "${RED}Fail2Ban 重启失败，请运行 fail2ban-client -d 检查配置。${PLAIN}"
+        return 1
+    fi
 }
 
 view_security_report() {
@@ -809,6 +841,28 @@ tcpfit_tune() {
     run_remote_script "tcpfit" "https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.sh" "bash"
 }
 
+start_iperf_server() {
+    local port="$1"
+    if ! has_cmd iperf3 && ! ensure_packages iperf3; then
+        log "${RED}iperf3 安装失败，无法启动服务端。${PLAIN}"
+        return 1
+    fi
+    pkill -x iperf3 2>/dev/null || true
+    if ! iperf3 -s -D -p "$port"; then
+        log "${RED}iperf3 服务端启动失败：端口 ${port}${PLAIN}"
+        return 1
+    fi
+    sleep 1
+    if ! ss -lntup 2>/dev/null | grep -qE ":${port}([[:space:]]|$)"; then
+        log "${RED}iperf3 未确认监听端口 ${port}，请检查端口占用/防火墙。${PLAIN}"
+        return 1
+    fi
+    if has_cmd ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+        log "${YELLOW}UFW 已启用；如客户端无法连接，请放行：ufw allow ${port}/tcp${PLAIN}"
+    fi
+    log "${GREEN}✅ iperf3 server 已后台运行：iperf3 -c <服务器IP> -p ${port}${PLAIN}"
+}
+
 speedtest_menu() {
     log "${YELLOW}--- Speedtest / iperf3 测速 ---${PLAIN}"
     if (( DRY_RUN )); then
@@ -822,9 +876,7 @@ speedtest_menu() {
     read -r -p "请选择 [1-4]: " n
     case "$n" in
         1)
-            has_cmd iperf3 || ensure_packages iperf3
-            iperf3 -s -D || true
-            log "${GREEN}✅ iperf3 server 已后台运行：iperf3 -c <服务器IP>${PLAIN}"
+            start_iperf_server 5201
             ;;
         2)
             pkill -x iperf3 2>/dev/null || true
@@ -845,12 +897,19 @@ security_audit() {
     clear 2>/dev/null || true
     log "${BLUE}================ VPS 安全体检 ================${PLAIN}"
     log "${YELLOW}SSH 配置:${PLAIN}"
-    if [[ -f /etc/ssh/sshd_config ]]; then
-        grep -Ei '^(Port|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication)' /etc/ssh/sshd_config || true
+    if has_cmd sshd && sshd -T >/dev/null 2>&1; then
+        sshd -T 2>/dev/null | grep -Ei '^(port|permitrootlogin|passwordauthentication|pubkeyauthentication|kbdinteractiveauthentication|challengeresponseauthentication) ' || true
+    else
+        grep -REhi '^[[:space:]]*(Port|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication)[[:space:]]+' \
+            /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null || true
     fi
 
     log "${YELLOW}SSH 监听:${PLAIN}"
-    ss -lntup | grep -E ':(22|2222)\b' || true
+    local ssh_ports ssh_ports_re
+    ssh_ports=$(get_effective_ssh_ports)
+    ssh_ports_re=${ssh_ports//,/|}
+    log "有效 SSH 端口: ${ssh_ports}"
+    ss -lntup | grep -E ":(${ssh_ports_re})([[:space:]]|$)" || true
 
     log "${YELLOW}最近登录:${PLAIN}"
     last -a | head -n 12 || true
@@ -1051,7 +1110,7 @@ tcp_backup_config() {
         net.ipv4.tcp_synack_retries \
         net.ipv4.tcp_ecn \
         > "$dir/runtime-sysctl.values" 2>/dev/null || true
-    if systemctl list-unit-files x-ui.service >/dev/null 2>&1; then
+    if systemctl cat x-ui.service >/dev/null 2>&1; then
         mkdir -p "$dir/systemd"
         cp -a /etc/systemd/system/x-ui.service.d "$dir/systemd/x-ui.service.d.bak" 2>/dev/null || true
     fi
@@ -1101,6 +1160,31 @@ tcp_neutralize_sysctl_conf_conflicts() {
     if [[ "$changed" -eq 1 ]]; then
         log "${YELLOW}已注释 /etc/sysctl.conf 中与 TCP 调优档冲突的旧参数（备份已保存）。${PLAIN}"
     fi
+}
+
+tcp_apply_safe_qdisc() {
+    local dev="$1" current
+    has_cmd tc || return 0
+    current=$(tc qdisc show dev "$dev" 2>/dev/null | awk 'NR==1{print $2}' || true)
+    case "$current" in
+        fq|mq|noqueue)
+            log "${BLUE}保留当前 qdisc：${current}${PLAIN}"
+            ;;
+        pfifo_fast|fq_codel|pfifo|pfifo_codel)
+            if tc qdisc replace dev "$dev" root fq 2>/dev/null; then
+                log "${GREEN}已将 ${dev} qdisc 设置为 fq。${PLAIN}"
+                ip link set dev "$dev" txqueuelen 10000 2>/dev/null || true
+            else
+                log "${YELLOW}qdisc 设置为 fq 失败，保留原队列：${current}${PLAIN}"
+            fi
+            ;;
+        "")
+            log "${YELLOW}未读取到 ${dev} 当前 qdisc，跳过覆盖。${PLAIN}"
+            ;;
+        *)
+            log "${YELLOW}检测到自定义 qdisc ${current}，为避免破坏限速/多队列配置，跳过覆盖。${PLAIN}"
+            ;;
+    esac
 }
 
 tcp_apply_profile() {
@@ -1213,11 +1297,10 @@ EOF
     local dev
     dev=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)
     if [[ -n "$dev" ]]; then
-        tc qdisc replace dev "$dev" root fq 2>/dev/null || true
-        ip link set dev "$dev" txqueuelen 10000 2>/dev/null || true
+        tcp_apply_safe_qdisc "$dev"
     fi
 
-    if systemctl list-unit-files x-ui.service >/dev/null 2>&1; then
+    if systemctl cat x-ui.service >/dev/null 2>&1; then
         mkdir -p /etc/systemd/system/x-ui.service.d
         cat > /etc/systemd/system/x-ui.service.d/override.conf <<'EOF'
 [Service]
@@ -1283,8 +1366,12 @@ tcp_iperf_helper() {
     echo "4. 查看 iperf3 状态"
     read -r -p "请选择 [1-4]: " n
     case "$n" in
-        1) has_cmd iperf3 || ensure_packages iperf3; pkill -x iperf3 2>/dev/null || true; iperf3 -s -D -p 5201; log "${GREEN}✅ 已启动：iperf3 -c <服务器IP> -p 5201${PLAIN}" ;;
-        2) read -r -p "输入端口: " p; [[ "$p" =~ ^[0-9]+$ ]] || { log "${RED}端口无效${PLAIN}"; return; }; has_cmd iperf3 || ensure_packages iperf3; pkill -x iperf3 2>/dev/null || true; iperf3 -s -D -p "$p"; log "${GREEN}✅ 已启动：iperf3 -c <服务器IP> -p ${p}${PLAIN}" ;;
+        1) start_iperf_server 5201 ;;
+        2)
+            read -r -p "输入端口: " p
+            [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 )) || { log "${RED}端口无效（1-65535）${PLAIN}"; return; }
+            start_iperf_server "$p"
+            ;;
         3) pkill -x iperf3 2>/dev/null || true; log "${GREEN}✅ 已停止 iperf3${PLAIN}" ;;
         4) pgrep -a iperf3 || log "${YELLOW}iperf3 未运行${PLAIN}"; ss -lntup | grep iperf3 || true ;;
         *) log "${RED}无效选择${PLAIN}" ;;
