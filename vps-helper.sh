@@ -112,13 +112,22 @@ run_remote_script() {
     local name="$1"
     local url="$2"
     local interpreter="$3"
-    local expected_sha="${4:-}"
+    local expected_sha=""
+    shift 3
+    if [[ $# -gt 0 ]]; then
+        expected_sha="$1"
+        shift
+    fi
+    local -a script_args=("$@")
     local tmp sha
 
     if [[ $DRY_RUN -eq 1 ]]; then
         log "${BLUE}[dry-run]${PLAIN} 将下载并执行远程脚本: ${name}"
         log "${BLUE}[dry-run]${PLAIN} URL: ${url}"
         log "${BLUE}[dry-run]${PLAIN} 解释器: ${interpreter}"
+        if (( ${#script_args[@]} )); then
+            log "${BLUE}[dry-run]${PLAIN} 参数: ${script_args[*]}"
+        fi
         return 0
     fi
 
@@ -146,7 +155,7 @@ run_remote_script() {
 
     chmod +x "$tmp" 2>/dev/null || true
     local rc=0
-    run_cmd "$interpreter" "$tmp" || rc=$?
+    run_cmd "$interpreter" "$tmp" "${script_args[@]}" || rc=$?
     rm -f "$tmp"
     return $rc
 }
@@ -869,13 +878,14 @@ network_test_center() {
         echo -e "${BLUE}================ 网络测速中心 ================${PLAIN}"
         echo "1. iperf3 服务端管理"
         echo "2. Speedtest 综合测速"
-        echo "3. IPv4/IPv6 网络质量检测"
-        echo "4. TCP 状态 / 重传 / qdisc 诊断"
-        echo "5. 根据 iperf3 结果给调优建议"
-        echo "6. 本地网络画像记录/对比"
+        echo "3. IBSGSS TCPQuality Speedtest（仅测速）"
+        echo "4. IPv4/IPv6 网络质量检测"
+        echo "5. TCP 状态 / 重传 / qdisc 诊断"
+        echo "6. 根据 iperf3 结果给调优建议"
+        echo "7. 本地网络画像记录/对比"
         echo "0. 返回"
         echo -e "${BLUE}==============================================${PLAIN}"
-        read -r -p "请选择 [0-6]: " n || return
+        read -r -p "请选择 [0-7]: " n || return
         case "$n" in
             1)
                 tcp_iperf_helper
@@ -884,17 +894,20 @@ network_test_center() {
                 run_remote_script "speedtest_script" "https://raw.githubusercontent.com/i-abc/Speedtest/main/speedtest.sh" "bash"
                 ;;
             3)
-                network_quality_check
+                run_remote_script "tcpquality_speedtest" "https://tcpquality.ibsgss.uk/run" "bash" "" --only-speedtest
                 ;;
             4)
+                network_quality_check
+                ;;
+            5)
                 tcp_show_current_state
                 echo ""
                 tcp_qdisc_diagnose
                 ;;
-            5)
+            6)
                 tcp_iperf_result_advisor
                 ;;
-            6)
+            7)
                 tcp_network_profile_menu
                 ;;
             0)
