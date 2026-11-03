@@ -893,6 +893,52 @@ speedtest_menu() {
     esac
 }
 
+network_test_center() {
+    while true; do
+        clear 2>/dev/null || true
+        echo -e "${BLUE}================ 网络测速中心 ================${PLAIN}"
+        echo "1. iperf3 服务端管理"
+        echo "2. Speedtest 综合测速"
+        echo "3. IPv4/IPv6 网络质量检测"
+        echo "4. TCP 状态 / 重传 / qdisc 诊断"
+        echo "5. 根据 iperf3 结果给调优建议"
+        echo "6. 本地网络画像记录/对比"
+        echo "0. 返回"
+        echo -e "${BLUE}==============================================${PLAIN}"
+        read -r -p "请选择 [0-6]: " n || return
+        case "$n" in
+            1)
+                tcp_iperf_helper
+                ;;
+            2)
+                run_remote_script "speedtest_script" "https://raw.githubusercontent.com/i-abc/Speedtest/main/speedtest.sh" "bash"
+                ;;
+            3)
+                network_quality_check
+                ;;
+            4)
+                tcp_show_current_state
+                echo ""
+                tcp_qdisc_diagnose
+                ;;
+            5)
+                tcp_iperf_result_advisor
+                ;;
+            6)
+                tcp_network_profile_menu
+                ;;
+            0)
+                return
+                ;;
+            *)
+                log "${RED}无效选项${PLAIN}"
+                ;;
+        esac
+        echo ""
+        read -r -p "按回车继续..." || return
+    done
+}
+
 security_audit() {
     clear 2>/dev/null || true
     log "${BLUE}================ VPS 安全体检 ================${PLAIN}"
@@ -1750,7 +1796,7 @@ while true; do
     echo -e "  14.🧩 Reality 节点参数辅助"
     echo -e "  15.🌐 网络质量检测"
     echo -e "  16.🔓 流媒体 / AI 解锁检测"
-    echo -e "  17.🧪 综合测速 / iperf3"
+    echo -e "  17.🧪 网络测速中心 (iperf3/Speedtest/IPv4/IPv6)"
     echo -e "  18.🔐 VPS 安全体检"
     echo -e "  19.🧰 tcpfit TCP 调优"
     echo -e "  20.🧠 TCP 智能调优/回滚"
@@ -1794,7 +1840,7 @@ while true; do
         14) generate_reality_link_helper ;;
         15) network_quality_check ;;
         16) unlock_media_ai_check ;;
-        17) speedtest_menu ;;
+        17) network_test_center ;;
         18) security_audit ;;
         19) tcpfit_tune ;;
         20) tcp_smart_tune_menu ;;
