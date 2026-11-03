@@ -437,7 +437,8 @@ release_port80_temporarily() {
 restore_port80_after_renew() {
     local unit
     # set -u 下，数组可能因异常/子 shell 未继承而未定义；先安全判断再展开。
-    if declare -p PORT80_STOPPED_UNITS >/dev/null 2>&1; then
+    # Bash 的 set -u 下，空数组直接展开也会触发 unbound variable。
+    if declare -p PORT80_STOPPED_UNITS >/dev/null 2>&1 && (( ${#PORT80_STOPPED_UNITS[@]} > 0 )); then
         for unit in "${PORT80_STOPPED_UNITS[@]}"; do
             log "${YELLOW}恢复服务: ${unit}${PLAIN}"
             run_cmd systemctl start "$unit" || true
