@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =========================================================
-# VPS 综合运维助手 (V9.6 TCP智能调优版)
+# VPS 综合运维助手 (V9.7 TCP智能调优版)
 # 重点改动：
 #  - 默认写操作日志到 /var/log/vps-helper.log
 #  - 远程脚本执行前下载到本地并显示 SHA256
@@ -1730,7 +1730,7 @@ while true; do
     BBR_INFO=$([[ "${local_tcp_ctrl}" == "bbr" ]] && echo -e "${GREEN}BBR已开启${PLAIN}" || echo -e "${YELLOW}未开启${PLAIN}")
 
     echo -e "${BLUE}==================================================${PLAIN}"
-    echo -e "${GREEN}       VPS 综合运维助手 V9.6 (TCP智能调优版)       ${PLAIN}"
+    echo -e "${GREEN}       VPS 综合运维助手 V9.7 (TCP智能调优版)       ${PLAIN}"
     echo -e "${BLUE}==================================================${PLAIN}"
     echo -e "  1. 🛡️  同步防御加固 (Fail2Ban jail.d)"
     echo -e "  2. 🚀  BBR / TCPx 加速管理 [${BBR_INFO}]"
