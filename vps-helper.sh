@@ -863,36 +863,6 @@ start_iperf_server() {
     log "${GREEN}✅ iperf3 server 已后台运行：iperf3 -c <服务器IP> -p ${port}${PLAIN}"
 }
 
-speedtest_menu() {
-    log "${YELLOW}--- Speedtest / iperf3 测速 ---${PLAIN}"
-    if (( DRY_RUN )); then
-        log "${BLUE}[dry-run]${PLAIN} 跳过 speedtest/iperf3 启停操作"
-        return 0
-    fi
-    echo "1. 启动 iperf3 服务端"
-    echo "2. 停止 iperf3 服务端"
-    echo "3. 查看 iperf3 状态"
-    echo "4. 执行 speedtest-go 一键测速脚本"
-    read -r -p "请选择 [1-4]: " n
-    case "$n" in
-        1)
-            start_iperf_server 5201
-            ;;
-        2)
-            pkill -x iperf3 2>/dev/null || true
-            log "${GREEN}✅ 已尝试停止 iperf3${PLAIN}"
-            ;;
-        3)
-            pgrep -a iperf3 || log "${YELLOW}iperf3 未运行${PLAIN}"
-            ss -lntup | grep ':5201' || true
-            ;;
-        4)
-            run_remote_script "speedtest_script" "https://raw.githubusercontent.com/i-abc/Speedtest/main/speedtest.sh" "bash"
-            ;;
-        *) log "${RED}无效选择${PLAIN}" ;;
-    esac
-}
-
 network_test_center() {
     while true; do
         clear 2>/dev/null || true
